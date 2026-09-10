@@ -1,0 +1,1296 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+HANFY RECON v7.0 — Unified Recon Tool with Built-in VirusTotal
+================================================================================
+NEW in v7.0:
+  • Built-in VT API scanner (replaces external vt-end tool)
+  • Multi-key rotation for faster VT scanning
+  • Unified report: subdomain + status + VT data in ONE file
+  • Status code dict returned per-subdomain for downstream use
+  • VT cache support to avoid re-scanning
+
+Focused pipeline:
+  1. Subdomain enum (subfinder + assetfinder + crt.sh + optional amass)
+  2. Optional dnsx pre-resolution (auto-use if available)
+  3. httpx probe → subs_live.txt + status_codes.txt (ONE file)
+  4. Built-in VT API scan → vt_results.json + vt.txt
+  5. Secrets scan on VT URLs ONLY (info disclosure focus)
+  6. 403 bypass on high-value 403 targets
+  7. Unified report (subdomain + status + VT)
+  8. Master ranked + Bug Bounty ready reports
+
+USAGE:
+    python3 hanfy_recon.py -d target.com
+    python3 hanfy_recon.py -d target.com --full-recon
+    python3 hanfy_recon.py -d target.com --subs-only
+    python3 hanfy_recon.py -d target.com --vt --vt-delay 10 --unified-report
+
+OUTPUT:
+    hanfy-recon/target.com/
+    ├── subs/
+    │   ├── target.com_subs_all.txt          (merged master list)
+    │   ├── target.com_probe_input.txt         (http:// / https:// for httpx)
+    │   └── target.com_subs_live.txt           (httpx full output)
+    ├── vt/
+    │   ├── virus.txt                          (clean sub.domain.com for VT)
+    │   ├── vt.txt                             (raw VT output)
+    │   └── vt_results.json                    (structured VT data per subdomain)
+    ├── reports/
+    │   ├── target.com_status_codes.txt        (ONE file, grouped by SC)
+    │   ├── target.com_unified_report.txt      (NEW: subdomain + status + VT)
+    │   ├── target.com_url_secrets.txt         (VT-only secrets scan)
+    │   ├── target.com_403_bypass.txt          (nomore403 results)
+    │   ├── target.com_master_ranked.txt       (severity-ranked combined)
+    │   └── target.com_bug_bounty_ready.txt  (clean BB report, score ≥60)
+    ├── bypassed/
+    │   └── 403_bypass_results.txt
+    └── logs/
+        └── target.com_recon.log
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
+from urllib.error import HTTPError
+
+# Try to import requests for VT API
+REQUESTS_AVAILABLE = False
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    pass
+
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+DEFAULT_DELAY = 0.1
+
+# =============================================================================
+# VIRUSTOTAL API KEYS (built-in rotation)
+# =============================================================================
+VT_API_KEYS = [
+    "9fdf8bf28e19f8cd45800756f7f3a740cd7e09913d9eadb79e1e8ae9f41cf88b",
+    "3ea967cdca70e94d8bf41bf9773cfee7f7d72e03efc306226bc453c7c1a36410",
+    "905c7d4d2a12fa09b24ecb74b1a702650dad20aa2fde81ccaea33ca90b1e9912",
+]
+
+# =============================================================================
+# SAFE PARAMS BLACKLIST — known analytics/tracking params to ignore
+# =============================================================================
+SAFE_PARAMS = {
+    'z', 'tt', 'dm', 'kw', 'ref', 'clid', 'gclid', 'fbclid', 'ttclid',
+    'utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term',
+    'utm_id', 'utm_source_platform', 'utm_creative_format', 'utm_marketing_tactic',
+    'si', 'igshid', 'mc_cid', 'mc_eid', 'mkt_tok', 'trk_contact',
+    'trk_msg', 'trk_module', 'trk_sid', 'itm_source', 'itm_medium',
+    'itm_campaign', 'itm_term', 'itm_content', 'gb_source', 'gb_medium',
+    'wicked_source', 'wicked_medium', 'wicked_campaign', 'wicked_id',
+    'wicked_placement', 'wicked_keyword', 'yclid', 'pk_campaign', 'pk_kwd',
+    'pk_keyword', 'pk_source', 'pk_medium', 'pk_content', 'pk_cid',
+    'piwik_campaign', 'piwik_kwd', 'piwik_keyword', 'mtm_source', 'mtm_medium',
+    'mtm_campaign', 'mtm_keyword', 'mtm_content', 'mtm_cid', 'mtm_group',
+    'mtm_placement', 'epik', 'sccid', 'rb_clickid', 'iris_track',
+    '_ga', '_gid', '_gac', '_gl', '_utm', 'gbraid', 'wbraid',
+}
+
+# =============================================================================
+# URL SECRET PATTERNS — Info Disclosure Focus (Simple & Clean)
+# =============================================================================
+URL_SECRET_PATTERNS = {
+    # === CRITICAL (Score 95-100) ===
+    'Password in URL': (r'[?&](?:password|passwd|pwd|pass|user_password)=[^&\s]{3,}', 100),
+    'AWS Key in URL': (r'[?&](?:aws_access_key_id|aws_secret_access_key)=[A-Za-z0-9/+=]{10,}', 100),
+    'Private Key in URL': (r'[?&](?:private_key|secret_key|secret)=[A-Za-z0-9/+=]{20,}', 100),
+    'Stripe Key in URL': (r'[?&](?:stripe|sk_live|pk_live)=[^&\s]{10,}', 100),
+
+    # === HIGH (Score 80-94) ===
+    'Token in URL': (r'[?&]token=[^&\s]{10,}', 95),
+    'API Key in URL': (r'[?&](?:api[_-]?key|apikey|api_token|access_token)=[^&\s]{10,}', 95),
+    'JWT in URL': (r'[?&](?:jwt|id_token|auth_token)=eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*', 95),
+    'OAuth Code in URL': (r'[?&]code=[A-Za-z0-9_-]{10,}', 95),
+    'GitHub Token in URL': (r'[?&]code=gh[oupr]_[A-Za-z0-9]{36}', 95),
+    'Reset Token in URL': (r'[?&](?:reset|recovery|verify|verification|confirm|activation)_token=[^&\s]{10,}', 90),
+    'Reset Password Link': (r'[?&](?:reset|recovery|forgot|password_reset|resetpassword|reset_password)=[^&\s]{5,}', 90),
+    'Session ID in URL': (r'[?&](?:sessionid|jsessionid|phpsessid|sid|session_id|sessid)=[^&\s]{10,}', 85),
+    'Auth Token in URL': (r'[?&](?:auth|authorization|bearer|access)=[^&\s]{10,}', 85),
+    'CSRF Token in URL': (r'[?&](?:csrf|csrf_token|_token|authenticity_token)=[^&\s]{10,}', 80),
+
+    # === MEDIUM (Score 60-79) ===
+    'Email in URL': (r'[?&](?:email|user|username|login|account|recipient|to)=[^@&\s]+@[^@&\s]+', 70),
+    'Phone in URL': (r'[?&](?:phone|mobile|tel|sms|whatsapp)=[+0-9]{8,}', 65),
+    'SSN in URL': (r'[?&](?:ssn|social|sin|tin)=[0-9]{3}-?[0-9]{2}-?[0-9]{4}', 75),
+    'Credit Card in URL': (r'[?&](?:card|cc|credit_card|cvv|cvc)=[0-9]{13,19}', 80),
+    'Voucher Code in URL': (r'[?&](?:voucher|coupon|promo|discount|code|gift|giftcard|promocode)=[A-Za-z0-9]{4,}', 70),
+    'Order ID in URL': (r'[?&](?:order|order_id|orderid|transaction|invoice|payment_id)=[A-Za-z0-9-]{5,}', 60),
+    'User ID in URL': (r'[?&](?:user_id|userid|uid|customer_id|account_id|member_id)=[0-9]{3,}', 60),
+
+    # === INFO DISCLOSURE / LOW (Score 50-59) ===
+    'Internal IP in URL': (r'[?&][a-z_]*=(?:192\.168|10\.|172\.(?:1[6-9]|2[0-9]|3[01]))\.[0-9.]+', 55),
+    'File Path in URL': (r'[?&](?:file|path|dir|directory|folder|location|doc)=[/\\][^&\s]+', 50),
+    'Database Name in URL': (r'[?&](?:db|database|dbname|schema|table)=[^&\s]+', 50),
+    'Server Info in URL': (r'[?&](?:server|host|port|env|environment|debug_mode)=[^&\s]+', 50),
+
+    # === NEW BUG BOUNTY PATTERNS ===
+    'Open Redirect Indicator': (r'[?&](?:next|redirect|return|url|goto|redir|return_to|redirect_uri|continue|destination)=[^&\s]{5,}', 55),
+    'Debug Mode Exposure': (r'[?&](?:debug|test|dev|development|staging|mode)=[1tTtRrUuEe]+', 50),
+    'XXE Indicator': (r'[?&](?:xml|dtd|xsl|xslt|entity|schema)=[^&\s]+', 50),
+    'LFI/Path Traversal Indicator': (r'[?&](?:file|path|folder|page|include|require|loc)=[^&\s]*(?:\.\.|%2e%2e|\.\./|\.\.\\)', 55),
+    'Encoded Credentials (Tight)': (r'[?&](?:payload|secret|auth_payload|encoded_key|encoded_token|enc)=[A-Za-z0-9+/]{20,}={0,2}', 55),
+}
+
+# Extensions to skip in URL secrets (never meaningful in query strings)
+SKIP_EXTENSIONS = {
+    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.ico', '.svg',
+    '.css', '.woff', '.woff2', '.ttf', '.eot', '.otf',
+    '.mp4', '.mp3', '.avi', '.mov', '.wmv', '.flv', '.mkv',
+    '.pdf', '.tar', '.gz', '.tgz', '.bz2', '.ppt', '.pptx', '.odt', '.ods',
+    '.exe', '.dll', '.bin', '.msi', '.dmg', '.apk', '.deb', '.rpm', '.pkg',
+    '.img', '.vmdk', '.vhd', '.log', '.cache', '.tmp', '.temp',
+    '.swf', '.fla', '.psd', '.ai', '.eps',
+}
+
+# High-value paths for 403 bypass targeting
+HIGH_VALUE_403_PATHS = [
+    'admin', 'api', 'config', 'dashboard', 'panel', 'console',
+    'manage', 'management', 'internal', 'private', 'secure',
+    'settings', 'env', 'debug', 'test', 'staging', 'dev', 'development',
+    'wp-admin', 'phpmyadmin', 'adminer', 'myadmin',
+    'api/v1', 'api/v2', 'api/v3', 'graphql', 'rest', 'swagger',
+    'api-docs', 'redoc', 'actuator', 'health', 'metrics', 'prometheus',
+    'config.json', '.env', 'env', 'backup', 'db', 'database',
+    'uploads', 'files', 'documents', 'exports', 'reports',
+    'login', 'register', 'signup', 'auth', 'oauth', 'sso',
+    'webhook', 'callback', 'redirect', 'proxy',
+    'git', 'svn', 'cvs', '.hg',
+    'server-status', 'server-info', 'phpinfo', 'info',
+    'robots.txt', 'sitemap.xml', 'crossdomain.xml',
+    '.well-known', 'actuator/health', 'actuator/env',
+]
+
+# Interesting status codes for bug bounty
+INTERESTING_STATUS_CODES = [200, 301, 302, 401, 403, 404, 405, 500, 502, 503]
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def run_cmd(cmd, timeout=300, shell=True):
+    try:
+        result = subprocess.run(cmd, shell=shell, capture_output=True, text=True,
+                               timeout=timeout, executable='/bin/bash')
+        return result.stdout, result.stderr, result.returncode
+    except subprocess.TimeoutExpired:
+        return "", "Timeout", 1
+    except Exception as e:
+        return "", str(e), 1
+
+def tool_exists(tool):
+    result = subprocess.run(f"which {tool}", shell=True, capture_output=True)
+    return result.returncode == 0
+
+def print_banner():
+    print(r"""
+    ██╗  ██╗ █████╗ ███╗   ██╗███████╗██╗   ██╗    ██████╗ ███████╗ ██████╗ ██████╗ ███╗   ██╗
+    ██║  ██║██╔══██╗████╗  ██║██╔════╝╚██╗ ██╔╝    ██╔══██╗██╔════╝██╔════╝██╔══██╗████╗  ██║
+    ███████║███████║██╔██╗ ██║█████╗   ╚████╔╝     ██████╔╝█████╗  ██║     ██████╔╝██╔██╗ ██║
+    ██╔══██║██╔══██║██║╚██╗██║██╔══╝    ╚██╔╝      ██╔══██╗██╔══╝  ██║     ██╔══██╗██║╚██╗██║
+    ██║  ██║██║  ██║██║ ╚████║██║        ██║       ██║  ██║███████╗╚██████╗██║  ██║██║ ╚████║
+    ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝        ╚═╝       ╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝
+                                    Recon Tool v7.0 — UNIFIED EDITION
+    """)
+
+def severity_label(score):
+    if score >= 90: return "🔴 CRITICAL"
+    elif score >= 75: return "🟠 HIGH"
+    elif score >= 60: return "🟡 MEDIUM"
+    elif score >= 50: return "🔵 LOW"
+    else: return "⚪ INFO"
+
+def log_message(msg, log_file=None):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    formatted = f"[{timestamp}] {msg}"
+    print(formatted)
+    if log_file:
+        with open(log_file, 'a') as f:
+            f.write(formatted + "\n")
+
+def is_safe_param(match_str):
+    """Check if a matched parameter is in the safe/analytics blacklist."""
+    param_part = match_str.split('=')[0] if '=' in match_str else ''
+    param_name = param_part.lstrip('?&').lower()
+    return param_name in SAFE_PARAMS
+
+def should_skip_url_for_secrets(url):
+    """Skip URLs with non-meaningful extensions for secrets."""
+    parsed = urllib.parse.urlparse(url)
+    path = parsed.path.lower()
+    for ext in SKIP_EXTENSIONS:
+        if path.endswith(ext):
+            return True
+    return False
+
+# =============================================================================
+# SUBDOMAIN ENUMERATION
+# =============================================================================
+
+def enum_subdomains(domain, outdir, deep=False, recursive=False, limit=0, threads=100, log_file=None):
+    """Enumerate subdomains using subfinder, assetfinder, amass, crt.sh.
+    Returns: (live_subs_list, all_subs_list, subdomain_info_dict)
+    """
+    subs_dir = Path(outdir) / "subs"
+    subs_dir.mkdir(parents=True, exist_ok=True)
+
+    all_file = subs_dir / f"{domain}_subs_all.txt"
+    live_file = subs_dir / f"{domain}_subs_live.txt"
+    probe_file = subs_dir / f"{domain}_probe_input.txt"
+
+    all_subs = set()
+
+    # 1. subfinder (fast, passive)
+    if tool_exists("subfinder"):
+        log_message("[*] Running subfinder...", log_file)
+        cmd = f"subfinder -d {domain} -all"
+        if recursive:
+            cmd += " -recursive"
+        cmd += f" -o /tmp/_hanfy_subfinder_{domain}.txt 2>/dev/null"
+        run_cmd(cmd, timeout=300)
+        tmp = Path(f"/tmp/_hanfy_subfinder_{domain}.txt")
+        if tmp.exists():
+            with open(tmp) as f:
+                for line in f:
+                    sub = line.strip().lower()
+                    if sub and sub.endswith(domain):
+                        all_subs.add(sub)
+            log_message(f"[+] subfinder: {len(all_subs)} subs", log_file)
+    else:
+        log_message("[-] subfinder not found", log_file)
+
+    # 2. assetfinder (additional passive)
+    if tool_exists("assetfinder"):
+        log_message("[*] Running assetfinder...", log_file)
+        stdout, stderr, rc = run_cmd(f"assetfinder --subs-only {domain} 2>/dev/null", timeout=300)
+        if stdout:
+            for line in stdout.strip().split('\n'):
+                sub = line.strip().lower()
+                if sub and sub.endswith(domain):
+                    all_subs.add(sub)
+            log_message(f"[+] assetfinder: {len(all_subs)} total subs", log_file)
+    else:
+        log_message("[-] assetfinder not found", log_file)
+
+    # 3. crt.sh (certificate transparency) with retry logic
+    log_message("[*] Querying crt.sh...", log_file)
+    crt_data = None
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                f"https://crt.sh/?q=%.{domain}&output=json",
+                headers={'User-Agent': USER_AGENT}
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                crt_data = json.loads(resp.read().decode())
+            break
+        except Exception as e:
+            wait = 5 * (attempt + 1)
+            log_message(f"[-] crt.sh attempt {attempt+1}/3 failed: {e} — retrying in {wait}s", log_file)
+            time.sleep(wait)
+
+    if crt_data:
+        for entry in crt_data:
+            name = entry.get('name_value', '').strip().lower()
+            for sub in name.split('\n'):
+                sub = sub.strip().lstrip(r'*\.').lstrip('*.')
+                if sub and sub.endswith(domain) and '.' in sub:
+                    all_subs.add(sub)
+        log_message(f"[+] crt.sh: {len(all_subs)} total subs", log_file)
+    else:
+        log_message("[-] crt.sh: all attempts failed", log_file)
+
+    # 4. amass deep (optional, slow)
+    if deep and tool_exists("amass"):
+        log_message("[*] Running amass deep passive (this may take a while)...", log_file)
+        stdout, stderr, rc = run_cmd(f"amass enum -passive -d {domain} 2>/dev/null", timeout=600)
+        if stdout:
+            for line in stdout.strip().split('\n'):
+                sub = line.strip().lower()
+                if sub and sub.endswith(domain):
+                    all_subs.add(sub)
+            log_message(f"[+] amass deep: {len(all_subs)} total subs", log_file)
+
+    # Save master subs list
+    with open(all_file, 'w') as f:
+        for sub in sorted(all_subs):
+            f.write(sub + '\n')
+
+    log_message(f"[+] Total unique subdomains: {len(all_subs)}", log_file)
+
+    # 5. Optional dnsx pre-resolution (auto-use if available)
+    resolved_subs = set()
+    if tool_exists("dnsx"):
+        log_message("[*] Running dnsx pre-resolution (optional, auto-detected)...", log_file)
+        dnsx_input = f"/tmp/_hanfy_dnsx_{domain}.txt"
+        dnsx_output = f"/tmp/_hanfy_dnsx_{domain}_out.txt"
+        with open(dnsx_input, 'w') as f:
+            for sub in sorted(all_subs):
+                f.write(sub + '\n')
+        stdout, stderr, rc = run_cmd(
+            f"dnsx -l {dnsx_input} -silent -o {dnsx_output} 2>/dev/null",
+            timeout=300
+        )
+        if Path(dnsx_output).exists():
+            with open(dnsx_output) as f:
+                for line in f:
+                    sub = line.strip().lower()
+                    if sub:
+                        resolved_subs.add(sub)
+            log_message(f"[+] dnsx resolved: {len(resolved_subs)} live DNS records", log_file)
+        else:
+            log_message("[-] dnsx returned no results, falling back to all subs", log_file)
+            resolved_subs = all_subs
+    else:
+        log_message("[-] dnsx not found, feeding all subs directly to httpx", log_file)
+        resolved_subs = all_subs
+
+    # 6. Wildcard detection
+    if len(resolved_subs) >= 5:
+        log_message("[*] Checking for wildcard DNS...", log_file)
+        ip_map = {}
+        sample = sorted(resolved_subs)[:20]
+        for sub in sample:
+            stdout, _, _ = run_cmd(f"dig +short {sub} | tail -n1", timeout=10)
+            ip = stdout.strip()
+            if ip:
+                ip_map[ip] = ip_map.get(ip, 0) + 1
+        for ip, count in ip_map.items():
+            if count >= 5:
+                log_message(f"[!] WILDCARD DETECTED: {count}/20 sample subs resolve to {ip}", log_file)
+                log_message(f"[!] *.domain.com wildcard is active — expect many false 'live' hosts", log_file)
+                break
+
+    # 7. httpx probe — find live subs
+    live_subs = set()
+    with open(probe_file, 'w') as f:
+        for sub in sorted(resolved_subs):
+            f.write(f"http://{sub}\nhttps://{sub}\n")
+
+    if tool_exists("httpx"):
+        log_message(f"[*] Probing subdomains with httpx ({threads} threads)...", log_file)
+        stdout, stderr, rc = run_cmd(
+            f"httpx -l {probe_file} -t {threads} -sc -title -tech -o {live_file} 2>/dev/null",
+            timeout=600
+        )
+
+        if live_file.exists():
+            with open(live_file) as f:
+                for line in f:
+                    url = line.strip().split()[0] if line.strip() else ''
+                    if url:
+                        parsed = urllib.parse.urlparse(url)
+                        live_subs.add(parsed.netloc.lower())
+            log_message(f"[+] Live subdomains: {len(live_subs)}", log_file)
+    else:
+        log_message("[-] httpx not found, returning all resolved subs unprobed", log_file)
+        live_subs = resolved_subs
+
+    # Apply limit
+    if limit > 0 and len(live_subs) > limit:
+        log_message(f"[*] Limiting to top {limit} live subdomains", log_file)
+        live_subs = set(sorted(live_subs)[:limit])
+
+    return sorted(live_subs), sorted(all_subs)
+
+
+# =============================================================================
+# STATUS CODES — ONE FILE + SUBDOMAIN INFO DICT
+# =============================================================================
+
+def scan_status_codes_with_httpx(urls, outdir, domain, threads=50, log_file=None):
+    """
+    Scan URLs with httpx and write ONE file grouped by status code.
+    Format: https://sub.workleap.com/path [200]
+    Returns: (status_results_dict, bypass_403_urls_list, subdomain_info_dict)
+    """
+    reports_dir = Path(outdir) / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    status_file = reports_dir / f"{domain}_status_codes.txt"
+
+    log_message(f"[*] Running httpx status code scan on {len(urls)} URLs...", log_file)
+
+    # Write all URLs to input file
+    input_file = Path(outdir) / "subs" / "_status_input_urls.txt"
+    with open(input_file, 'w') as f:
+        for url in urls:
+            f.write(url + '\n')
+
+    # Run httpx with status codes
+    output_file = Path(outdir) / "subs" / "_httpx_output.txt"
+    stdout, stderr, rc = run_cmd(
+        f"httpx -l {input_file} -t {threads} -sc -title -tech -o {output_file} -silent 2>/dev/null",
+        timeout=600
+    )
+
+    # Parse httpx output with REGEX (fixed parser)
+    status_results = {code: [] for code in INTERESTING_STATUS_CODES}
+    status_results['other'] = []
+    all_results = []
+    bypass_403_urls = []
+    subdomain_info = {}  # NEW: dict mapping subdomain -> {status, title, tech}
+
+    if output_file.exists():
+        with open(output_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                # FIX: Use regex to extract first 3-digit status code
+                match = re.search(r' \[(\d{3})\]', line)
+                if match:
+                    url = line.split(' [')[0].strip()
+                    try:
+                        status = int(match.group(1))
+                    except ValueError:
+                        continue
+
+                    all_results.append({'url': url, 'status': status, 'raw': line})
+
+                    if status in status_results:
+                        status_results[status].append(url)
+                    else:
+                        status_results['other'].append(url)
+
+                    if status == 403:
+                        bypass_403_urls.append(url)
+
+                    # NEW: Build subdomain_info dict
+                    parsed = urllib.parse.urlparse(url)
+                    sub = parsed.netloc.lower()
+                    if sub not in subdomain_info:
+                        subdomain_info[sub] = {
+                            'status': status,
+                            'title': '',
+                            'tech': '',
+                            'url': url,
+                        }
+                    # Try to extract title and tech from raw line
+                    # httpx format: https://sub.com [200] [Title] [tech1,tech2]
+                    title_match = re.search(r'\[([^\]]+)\]', line)
+                    if title_match:
+                        parts = re.findall(r'\[([^\]]+)\]', line)
+                        if len(parts) >= 2:
+                            subdomain_info[sub]['title'] = parts[1] if not parts[1].isdigit() else ''
+                        if len(parts) >= 3:
+                            subdomain_info[sub]['tech'] = parts[2]
+
+    # Write ONE file grouped by status code
+    with open(status_file, 'w') as f:
+        f.write("=" * 80 + "\n")
+        f.write(f"HANFY RECON v7.0 — STATUS CODES for {domain}\n")
+        f.write("=" * 80 + "\n\n")
+
+        for code in INTERESTING_STATUS_CODES:
+            urls_list = status_results[code]
+            if urls_list:
+                f.write(f"\n{'='*60}\n")
+                f.write(f"STATUS {code} — {len(urls_list)} URLs\n")
+                f.write(f"{'='*60}\n\n")
+                for url in sorted(urls_list):
+                    f.write(f"{url} [{code}]\n")
+
+        other = status_results['other']
+        if other:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"OTHER STATUS CODES — {len(other)} URLs\n")
+            f.write(f"{'='*60}\n\n")
+            for entry in sorted(other):
+                f.write(f"{entry}\n")
+
+    log_message(f"[+] Status codes: {status_file}", log_file)
+    for code in INTERESTING_STATUS_CODES:
+        count = len(status_results[code])
+        if count > 0:
+            log_message(f"    [{code}]: {count} URLs", log_file)
+    log_message(f"[+] 403 bypass targets: {len(bypass_403_urls)}", log_file)
+    log_message(f"[+] Subdomain info collected: {len(subdomain_info)} entries", log_file)
+
+    return status_results, bypass_403_urls, subdomain_info
+
+
+# =============================================================================
+# VIRUSTOTAL API — BUILT-IN PYTHON SCANNER (replaces vt-end)
+# =============================================================================
+
+def vt_api_scan(subdomains, domain, outdir, delay=15, vt_limit=0, log_file=None):
+    """
+    Built-in VirusTotal API scanner using Python requests.
+    Multi-key rotation for faster scanning.
+    Returns: (vt_results_dict, vt_urls_list)
+
+    vt_results = {
+        "sub.domain.com": {
+            "malicious": 0, "suspicious": 1, "undetected": 79,
+            "harmless": 0, "reputation": 0, "categories": []
+        }
+    }
+    """
+    if not REQUESTS_AVAILABLE:
+        log_message("[-] 'requests' library not installed. Install: pip install requests", log_file)
+        return {}, []
+
+    vt_dir = Path(outdir) / "vt"
+    vt_dir.mkdir(parents=True, exist_ok=True)
+
+    virus_file = vt_dir / "virus.txt"
+    vt_output_file = vt_dir / "vt.txt"
+    vt_cache_file = vt_dir / "vt_cache.json"
+
+    # Save virus.txt (clean subdomains for reference)
+    with open(virus_file, 'w') as f:
+        for sub in sorted(subdomains):
+            f.write(f"{sub}\n")
+
+    # Load cache if exists
+    cached_results = {}
+    if vt_cache_file.exists():
+        try:
+            with open(vt_cache_file) as f:
+                cached_results = json.load(f)
+            log_message(f"[*] Loaded VT cache: {len(cached_results)} cached entries", log_file)
+        except:
+            cached_results = {}
+
+    vt_results = {}
+    vt_urls = []
+
+    # Apply limit
+    subs_to_scan = subdomains
+    if vt_limit > 0 and len(subdomains) > vt_limit:
+        log_message(f"[*] VT limit applied: scanning top {vt_limit} of {len(subdomains)} subdomains", log_file)
+        subs_to_scan = subdomains[:vt_limit]
+
+    log_message(f"[*] Starting VT API scan on {len(subs_to_scan)} subdomains (delay: {delay}s, keys: {len(VT_API_KEYS)})", log_file)
+
+    key_index = 0
+    request_count = 0
+    requests_per_key = 4  # VT free tier: ~4 req/min per key
+
+    for i, sub in enumerate(subs_to_scan):
+        # Check cache first
+        if sub in cached_results:
+            vt_results[sub] = cached_results[sub]
+            log_message(f"    [CACHE] {sub} — skipped", log_file)
+            continue
+
+        api_key = VT_API_KEYS[key_index]
+        url = f"https://www.virustotal.com/api/v3/domains/{sub}"
+        headers = {"x-apikey": api_key}
+
+        try:
+            resp = requests.get(url, headers=headers, timeout=30)
+
+            if resp.status_code == 200:
+                data = resp.json()
+                attrs = data.get('data', {}).get('attributes', {})
+                stats = attrs.get('last_analysis_stats', {})
+
+                result = {
+                    'malicious': stats.get('malicious', 0),
+                    'suspicious': stats.get('suspicious', 0),
+                    'undetected': stats.get('undetected', 0),
+                    'harmless': stats.get('harmless', 0),
+                    'reputation': attrs.get('reputation', 0),
+                    'categories': attrs.get('categories', {}),
+                }
+                vt_results[sub] = result
+
+                total = result['malicious'] + result['suspicious'] + result['undetected'] + result['harmless']
+                log_message(f"    [VT] {sub} — M:{result['malicious']} S:{result['suspicious']} U:{result['undetected']} (rep: {result['reputation']})", log_file)
+
+            elif resp.status_code == 404:
+                # Domain not in VT database
+                vt_results[sub] = {
+                    'malicious': 0, 'suspicious': 0, 'undetected': 0,
+                    'harmless': 0, 'reputation': 0, 'categories': {},
+                    'not_found': True
+                }
+                log_message(f"    [VT] {sub} — not found in VT database", log_file)
+
+            elif resp.status_code == 429:
+                log_message(f"    [VT] {sub} — rate limited, switching key...", log_file)
+                key_index = (key_index + 1) % len(VT_API_KEYS)
+                time.sleep(2)
+                continue  # Retry this subdomain
+
+            else:
+                log_message(f"    [VT] {sub} — HTTP {resp.status_code}", log_file)
+
+        except Exception as e:
+            log_message(f"    [VT] {sub} — error: {e}", log_file)
+
+        # Key rotation logic
+        request_count += 1
+        if request_count >= requests_per_key:
+            key_index = (key_index + 1) % len(VT_API_KEYS)
+            request_count = 0
+            log_message(f"[*] Switched to VT API key #{key_index + 1}", log_file)
+
+        # Progress
+        if (i + 1) % 10 == 0:
+            log_message(f"[*] VT progress: {i+1}/{len(subs_to_scan)} subdomains scanned", log_file)
+
+        # Delay between requests
+        if i < len(subs_to_scan) - 1:
+            time.sleep(delay)
+
+    # Save cache
+    with open(vt_cache_file, 'w') as f:
+        json.dump(vt_results, f, indent=2)
+    log_message(f"[+] VT cache saved: {vt_cache_file}", log_file)
+
+    # Write clean vt.txt output
+    with open(vt_output_file, 'w') as f:
+        f.write("=" * 80 + "\n")
+        f.write(f"HANFY RECON v7.0 — VIRUSTOTAL RESULTS for {domain}\n")
+        f.write("=" * 80 + "\n\n")
+
+        for sub, result in sorted(vt_results.items()):
+            f.write(f"Fetching data for domain: {sub}\n")
+            if result.get('not_found'):
+                f.write(f"No undetected URLs found for domain: {sub}\n")
+            else:
+                total = result['malicious'] + result['suspicious'] + result['undetected'] + result['harmless']
+                f.write(f"  Malicious: {result['malicious']} | Suspicious: {result['suspicious']}\n")
+                f.write(f"  Undetected: {result['undetected']} | Harmless: {result['harmless']}\n")
+                f.write(f"  Reputation: {result['reputation']}\n")
+                if result.get('categories'):
+                    f.write(f"  Categories: {', '.join(result['categories'].values())}\n")
+            f.write("\n" * 3)
+
+    # Extract "undetected" URLs (domains with clean reputation)
+    for sub, result in vt_results.items():
+        if not result.get('not_found') and result.get('undetected', 0) > 0:
+            # Build potential URLs from undetected domains
+            vt_urls.append(f"https://{sub}")
+            vt_urls.append(f"http://{sub}")
+
+    vt_urls = list(dict.fromkeys(vt_urls))  # dedup
+    log_message(f"[+] VT scan complete: {len(vt_results)} domains scanned, {len(vt_urls)} undetected URLs", log_file)
+
+    return vt_results, vt_urls
+
+
+# =============================================================================
+# UNIFIED REPORT — subdomain + status + VT in ONE file
+# =============================================================================
+
+def generate_unified_report(domain, outdir, subdomain_info, vt_results, log_file=None):
+    """
+    Generate unified_report.txt combining subdomain, status, title, tech, and VT data.
+    """
+    report_file = Path(outdir) / "reports" / f"{domain}_unified_report.txt"
+    report_file.parent.mkdir(parents=True, exist_ok=True)
+
+    log_message(f"[*] Generating unified report...", log_file)
+
+    with open(report_file, 'w') as f:
+        f.write("=" * 80 + "\n")
+        f.write(f"HANFY RECON v7.0 — UNIFIED REPORT for {domain}\n")
+        f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("=" * 80 + "\n\n")
+
+        # Header
+        f.write(f"{'Subdomain':<40} {'Status':<8} {'VT_M':<5} {'VT_S':<5} {'VT_C':<5} {'Rep':<5} {'Title / Tech'}\n")
+        f.write("-" * 100 + "\n")
+
+        # Combine all subdomains from both sources
+        all_subs = set(subdomain_info.keys()) | set(vt_results.keys())
+
+        for sub in sorted(all_subs):
+            info = subdomain_info.get(sub, {})
+            vt = vt_results.get(sub, {})
+
+            status = info.get('status', 'N/A')
+            title = info.get('title', '')
+            tech = info.get('tech', '')
+            url = info.get('url', f"https://{sub}")
+
+            if vt.get('not_found'):
+                vt_m = vt_s = vt_c = rep = 'N/A'
+            else:
+                vt_m = vt.get('malicious', 0)
+                vt_s = vt.get('suspicious', 0)
+                vt_c = vt.get('undetected', 0)
+                rep = vt.get('reputation', 0)
+
+            # Summary line
+            f.write(f"{sub:<40} {status:<8} {vt_m:<5} {vt_s:<5} {vt_c:<5} {rep:<5} {title}")
+            if tech:
+                f.write(f" [{tech}]")
+            f.write("\n")
+
+            # Detail block
+            f.write(f"  URL: {url}\n")
+            if vt and not vt.get('not_found'):
+                f.write(f"  VT: Malicious={vt_m} | Suspicious={vt_s} | Clean={vt_c} | Reputation={rep}\n")
+                if vt.get('categories'):
+                    f.write(f"  Categories: {', '.join(vt['categories'].values())}\n")
+            f.write("\n")
+
+    log_message(f"[+] Unified report: {report_file}", log_file)
+    return report_file
+
+
+# =============================================================================
+# URL SECRETS SCANNER — VT URLs ONLY, INFO DISCLOSURE FOCUS
+# =============================================================================
+
+def scan_url_secrets(urls, report_file, min_score=50, log_file=None):
+    """Scan URLs for embedded secrets — VT URLs only, info disclosure focus."""
+    findings = []
+    skipped_safe = 0
+    skipped_ext = 0
+
+    log_message(f"[*] Scanning {len(urls)} VT URLs for secrets (info disclosure focus)...", log_file)
+
+    for url in urls:
+        if should_skip_url_for_secrets(url):
+            skipped_ext += 1
+            continue
+
+        parsed = urllib.parse.urlparse(url)
+        query = parsed.query
+        full_url = url
+
+        for name, (pattern, score) in URL_SECRET_PATTERNS.items():
+            if score < min_score:
+                continue
+
+            # Check query string
+            for match in re.finditer(pattern, query):
+                match_str = match.group(0)
+                if is_safe_param(match_str):
+                    skipped_safe += 1
+                    continue
+                findings.append({
+                    'url': url,
+                    'type': name,
+                    'match': match_str,
+                    'score': score,
+                    'location': 'query',
+                })
+
+            # Check full URL (some patterns match path too)
+            for match in re.finditer(pattern, full_url):
+                match_str = match.group(0)
+                if is_safe_param(match_str):
+                    skipped_safe += 1
+                    continue
+                # Avoid duplicates
+                if not any(f['url'] == url and f['match'] == match_str for f in findings):
+                    findings.append({
+                        'url': url,
+                        'type': name,
+                        'match': match_str,
+                        'score': score,
+                        'location': 'url',
+                    })
+
+    # Sort by score descending
+    findings.sort(key=lambda x: -x['score'])
+
+    with open(report_file, 'w') as f:
+        f.write("=" * 80 + "\n")
+        f.write("HANFY RECON v7.0 — URL SECRETS REPORT (INFO DISCLOSURE FOCUS)\n")
+        f.write("=" * 80 + "\n\n")
+        f.write(f"Total URLs scanned: {len(urls)}\n")
+        f.write(f"Secrets found: {len(findings)}\n")
+        f.write(f"Skipped (safe params): {skipped_safe}\n")
+        f.write(f"Skipped (bad extensions): {skipped_ext}\n")
+        f.write(f"Minimum score threshold: {min_score}\n\n")
+
+        if findings:
+            current_score = None
+            for i, finding in enumerate(findings, 1):
+                if finding['score'] != current_score:
+                    current_score = finding['score']
+                    label = severity_label(current_score)
+                    f.write(f"\n{'='*80}\n")
+                    f.write(f"{label} (Score: {current_score})\n")
+                    f.write(f"{'='*80}\n\n")
+
+                f.write(f"SECRET #{i}: {finding['type']}\n")
+                f.write(f"URL: {finding['url']}\n")
+                f.write(f"MATCH: {finding['match']}\n")
+                f.write(f"LOCATION: {finding['location']}\n\n")
+        else:
+            f.write("No URL secrets found above threshold.\n")
+
+    log_message(f"[+] URL secrets: {report_file} ({len(findings)} findings, {skipped_safe} safe-param skips, {skipped_ext} ext skips)", log_file)
+    return findings
+
+
+# =============================================================================
+# 403 BYPASS (using nomore403)
+# =============================================================================
+
+def bypass_403(urls, outdir, domain, threads=50, log_file=None):
+    """Try 403 bypass on high-value endpoints using nomore403."""
+    bypass_dir = Path(outdir) / "bypassed"
+    bypass_dir.mkdir(parents=True, exist_ok=True)
+    report_file = Path(outdir) / "reports" / f"{domain}_403_bypass.txt"
+    report_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if not tool_exists("nomore403"):
+        log_message("[-] nomore403 not found (install: go install github.com/devploit/nomore403@latest)", log_file)
+        return []
+
+    # Filter to high-value paths
+    target_urls = []
+    for url in urls:
+        parsed = urllib.parse.urlparse(url)
+        path = parsed.path.lower()
+        if any(hv in path for hv in HIGH_VALUE_403_PATHS):
+            target_urls.append(url)
+
+    log_message(f"[*] Attempting 403 bypass on {len(target_urls)} high-value URLs...", log_file)
+
+    # Write targets to file for nomore403
+    targets_file = bypass_dir / f"{domain}_403_targets.txt"
+    with open(targets_file, 'w') as f:
+        for url in target_urls:
+            f.write(url + '\n')
+
+    # Run nomore403
+    output_file = bypass_dir / f"{domain}_nomore403_output.txt"
+    stdout, stderr, rc = run_cmd(
+        f"nomore403 -u {targets_file} --random-agent -d 50 -l -o {output_file} 2>/dev/null",
+        timeout=600
+    )
+
+    # Parse nomore403 output
+    bypassed = []
+    if output_file.exists():
+        with open(output_file) as f:
+            for line in f:
+                if any(indicator in line for indicator in ['200', 'bypass', 'success']):
+                    url_match = re.search(r'(https?://[^\s]+)', line)
+                    if url_match:
+                        bypassed.append({
+                            'original': url_match.group(1),
+                            'result': line.strip(),
+                        })
+
+    with open(report_file, 'w') as f:
+        f.write("=" * 80 + "\n")
+        f.write(f"HANFY RECON v7.0 — 403 BYPASS RESULTS for {domain}\n")
+        f.write("=" * 80 + "\n\n")
+        f.write(f"Total targets: {len(target_urls)}\n")
+        f.write(f"Successful bypasses: {len(bypassed)}\n\n")
+
+        if bypassed:
+            for i, entry in enumerate(bypassed, 1):
+                f.write(f"BYPASS #{i}:\n")
+                f.write(f"  URL: {entry['original']}\n")
+                f.write(f"  Result: {entry['result']}\n\n")
+        else:
+            f.write("No successful bypasses.\n")
+
+    log_message(f"[+] 403 bypass: {report_file} ({len(bypassed)} successes)", log_file)
+    return bypassed
+
+
+# =============================================================================
+# MASTER RANKING REPORT
+# =============================================================================
+
+def generate_master_report(domain, outdir, url_secrets, bypassed_403, status_codes, log_file=None):
+    """Generate master severity-ranked report combining all findings."""
+    report_file = Path(outdir) / "reports" / f"{domain}_master_ranked.txt"
+    report_file.parent.mkdir(parents=True, exist_ok=True)
+
+    all_findings = []
+
+    # URL secrets
+    for f in url_secrets:
+        all_findings.append({
+            'type': f"URL SECRET: {f['type']}",
+            'url': f['url'],
+            'detail': f['match'],
+            'score': f['score'],
+        })
+
+    # Bypassed 403
+    for b in bypassed_403:
+        all_findings.append({
+            'type': "403 BYPASS",
+            'url': b['original'],
+            'detail': b['result'],
+            'score': 85,
+        })
+
+    # Status codes (only 401 and 403 are interesting enough)
+    for code in [401, 403]:
+        for url in status_codes.get(code, [])[:20]:
+            all_findings.append({
+                'type': f"STATUS {code}",
+                'url': url,
+                'detail': "Authentication required / Forbidden",
+                'score': 60 if code == 401 else 55,
+            })
+
+    # DEDUPLICATE before sorting
+    seen = set()
+    unique_findings = []
+    for f in all_findings:
+        key = (f['type'], f['url'])
+        if key not in seen:
+            seen.add(key)
+            unique_findings.append(f)
+
+    # Sort by score descending
+    unique_findings.sort(key=lambda x: -x['score'])
+
+    with open(report_file, 'w') as f:
+        f.write("=" * 80 + "\n")
+        f.write(f"HANFY RECON v7.0 — MASTER RANKED REPORT for {domain}\n")
+        f.write("=" * 80 + "\n\n")
+        f.write(f"Total findings: {len(unique_findings)}\n")
+        f.write(f"Score threshold: >50\n\n")
+
+        # Summary by category
+        categories = {}
+        for finding in unique_findings:
+            cat = finding['type'].split(':')[0]
+            categories[cat] = categories.get(cat, 0) + 1
+
+        f.write("SUMMARY BY CATEGORY:\n")
+        f.write("-" * 40 + "\n")
+        for cat, count in sorted(categories.items(), key=lambda x: -x[1]):
+            f.write(f"  {cat}: {count}\n")
+        f.write("\n")
+
+        # Ranked findings
+        f.write("=" * 80 + "\n")
+        f.write("RANKED FINDINGS (Highest Score First)\n")
+        f.write("=" * 80 + "\n\n")
+
+        current_score = None
+        for i, finding in enumerate(unique_findings, 1):
+            if finding['score'] != current_score:
+                current_score = finding['score']
+                label = severity_label(current_score)
+                f.write(f"\n{'='*80}\n")
+                f.write(f"{label} (Score: {current_score})\n")
+                f.write(f"{'='*80}\n\n")
+
+            f.write(f"RANK #{i}: {finding['type']}\n")
+            f.write(f"  URL: {finding['url']}\n")
+            f.write(f"  Detail: {finding['detail']}\n\n")
+
+    log_message(f"[+] Master report: {report_file}", log_file)
+    return unique_findings
+
+
+# =============================================================================
+# BUG BOUNTY READY REPORT
+# =============================================================================
+
+def generate_bug_bounty_report(domain, outdir, all_findings, log_file=None):
+    """Generate a clean bug bounty submission report."""
+    report_file = Path(outdir) / "reports" / f"{domain}_bug_bounty_ready.txt"
+    report_file.parent.mkdir(parents=True, exist_ok=True)
+
+    log_message(f"[*] Generating bug bounty ready report...", log_file)
+
+    # Filter to high-value findings only (score >= 60)
+    bb_findings = [f for f in all_findings if f['score'] >= 60]
+
+    with open(report_file, 'w') as f:
+        f.write("=" * 80 + "\n")
+        f.write(f"BUG BOUNTY SUBMISSION REPORT — {domain.upper()}\n")
+        f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("=" * 80 + "\n\n")
+
+        f.write("EXECUTIVE SUMMARY:\n")
+        f.write("-" * 40 + "\n")
+        f.write(f"Target: {domain}\n")
+        f.write(f"Total High-Value Findings: {len(bb_findings)}\n")
+        f.write(f"Critical: {len([f for f in bb_findings if f['score'] >= 90])}\n")
+        f.write(f"High: {len([f for f in bb_findings if 75 <= f['score'] < 90])}\n")
+        f.write(f"Medium: {len([f for f in bb_findings if 60 <= f['score'] < 75])}\n\n")
+
+        f.write("=" * 80 + "\n")
+        f.write("FINDINGS READY FOR SUBMISSION\n")
+        f.write("=" * 80 + "\n\n")
+
+        for i, finding in enumerate(bb_findings, 1):
+            label = severity_label(finding['score'])
+            f.write(f"\n{'─'*60}\n")
+            f.write(f"FINDING #{i} — {label}\n")
+            f.write(f"{'─'*60}\n")
+            f.write(f"Type: {finding['type']}\n")
+            f.write(f"URL: {finding['url']}\n")
+            f.write(f"Detail: {finding['detail']}\n")
+            f.write(f"Severity Score: {finding['score']}/100\n")
+            f.write(f"\nImpact: ")
+
+            if finding['score'] >= 90:
+                f.write("CRITICAL — Immediate data exposure or unauthorized access.\n")
+            elif finding['score'] >= 75:
+                f.write("HIGH — Significant information disclosure or access bypass.\n")
+            elif finding['score'] >= 60:
+                f.write("MEDIUM — Potential information leakage or access issue.\n")
+
+            f.write(f"\nRecommendation: Investigate and remediate immediately.\n")
+
+    log_message(f"[+] Bug Bounty report: {report_file}", log_file)
+    return bb_findings
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='HANFY RECON v7.0 — Unified Recon Tool with Built-in VirusTotal',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+FULL COMMAND EXAMPLES:
+  # Complete recon (everything)
+  python3 hanfy_recon.py -d target.com --full-recon
+
+  # Subdomains + VT + Secrets + 403 bypass
+  python3 hanfy_recon.py -d target.com --subs-deep --vt --bypass
+
+  # Subdomains only
+  python3 hanfy_recon.py -d target.com --subs-only
+
+  # Fast VT scan with lower delay
+  python3 hanfy_recon.py -d target.com --vt --vt-delay 10 --unified-report
+
+  # Limit VT to top 100 subdomains
+  python3 hanfy_recon.py -d target.com --vt --vt-limit 100
+        """
+    )
+    parser.add_argument('-d', '--domain', required=True, help='Target domain')
+    parser.add_argument('-o', '--output', default='hanfy-recon', help='Output directory')
+
+    # Subdomain options
+    parser.add_argument('--subs-only', action='store_true', help='Only enumerate subdomains')
+    parser.add_argument('--subs-deep', action='store_true', help='Use amass deep passive')
+    parser.add_argument('--subs-recursive', action='store_true', help='Recursive subdomain enum')
+    parser.add_argument('--subs-limit', type=int, default=0, help='Max live subdomains (0=all)')
+    parser.add_argument('--subs-threads', type=int, default=100, help='Subdomain probe threads')
+
+    # URL secrets
+    parser.add_argument('--url-secrets', action='store_true', help='Scan VT URLs for secrets')
+    parser.add_argument('--min-score', type=int, default=50, help='Minimum severity score (default: 50)')
+
+    # VirusTotal (NEW built-in)
+    parser.add_argument('--vt', action='store_true', help='Run built-in VT API scan on all subdomains')
+    parser.add_argument('--vt-only', action='store_true', help='Only run VT + secrets on existing subs')
+    parser.add_argument('--vt-delay', type=int, default=15, help='Delay between VT requests in seconds (default: 15)')
+    parser.add_argument('--vt-limit', type=int, default=0, help='Max subdomains to scan with VT (0=all)')
+
+    # 403 bypass
+    parser.add_argument('--bypass', action='store_true', help='Attempt 403 bypass')
+
+    # Unified report
+    parser.add_argument('--unified-report', action='store_true', help='Generate unified subdomain+status+VT report')
+
+    # Full recon
+    parser.add_argument('--full-recon', action='store_true', help='Run everything')
+
+    # Speed
+    parser.add_argument('-t', '--threads', type=int, default=50, help='General threads (default: 50)')
+    parser.add_argument('--delay', type=float, default=DEFAULT_DELAY, help='Request delay')
+
+    args = parser.parse_args()
+
+    print_banner()
+
+    domain = args.domain.strip().lower().replace('https://', '').replace('http://', '').replace('/', '')
+    outdir = Path(args.output) / domain
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    (outdir / "reports").mkdir(exist_ok=True)
+    (outdir / "subs").mkdir(exist_ok=True)
+    (outdir / "vt").mkdir(exist_ok=True)
+    (outdir / "bypassed").mkdir(exist_ok=True)
+    (outdir / "logs").mkdir(exist_ok=True)
+
+    log_file = outdir / "logs" / f"{domain}_recon.log"
+
+    # Full recon enables everything
+    if args.full_recon:
+        args.vt = True
+        args.bypass = True
+        args.url_secrets = True
+        args.subs_deep = True
+        args.unified_report = True
+
+    # Determine what to run
+    run_subs = not args.vt_only
+    run_vt = args.vt or args.vt_only
+    run_secrets = args.url_secrets or args.vt_only or args.full_recon
+    run_bypass = args.bypass and not args.vt_only
+    run_status = not args.vt_only  # Always run status codes when doing subs
+
+    # =====================================================================
+    # PHASE 1: SUBDOMAIN ENUMERATION
+    # =====================================================================
+    subs = []
+    all_subs = []
+    if run_subs:
+        log_message(f"\n{'='*60}", log_file)
+        log_message(f"PHASE 1: Subdomain Enumeration", log_file)
+        log_message(f"{'='*60}\n", log_file)
+
+        subs, all_subs = enum_subdomains(
+            domain, outdir,
+            deep=args.subs_deep,
+            recursive=args.subs_recursive,
+            limit=args.subs_limit,
+            threads=args.subs_threads,
+            log_file=log_file
+        )
+
+        if args.subs_only:
+            log_message(f"\n{'='*60}", log_file)
+            log_message(f"SUBDOMAIN ENUMERATION COMPLETE", log_file)
+            log_message(f"{'='*60}", log_file)
+            log_message(f"Results in: {outdir / 'subs'}", log_file)
+            return
+
+    # =====================================================================
+    # PHASE 2: STATUS CODES (httpx) — ONE FILE + SUBDOMAIN INFO DICT
+    # =====================================================================
+    status_codes = {}
+    bypass_403_urls = []
+    subdomain_info = {}  # NEW: dict for unified report
+    if run_status and subs:
+        log_message(f"\n{'='*60}", log_file)
+        log_message(f"PHASE 2: Status Code Scan (httpx)", log_file)
+        log_message(f"{'='*60}\n", log_file)
+
+        # Build full URLs from live subs for status scan
+        urls_to_scan = []
+        for sub in subs:
+            urls_to_scan.append(f"https://{sub}")
+            urls_to_scan.append(f"http://{sub}")
+        urls_to_scan = list(dict.fromkeys(urls_to_scan))
+
+        status_codes, bypass_403_urls, subdomain_info = scan_status_codes_with_httpx(
+            urls_to_scan, outdir, domain, threads=args.threads, log_file=log_file
+        )
+
+    # =====================================================================
+    # PHASE 3: VIRUSTOTAL — BUILT-IN PYTHON SCANNER
+    # =====================================================================
+    vt_results = {}  # NEW: structured VT results per subdomain
+    vt_urls = []
+    if run_vt and all_subs:
+        log_message(f"\n{'='*60}", log_file)
+        log_message(f"PHASE 3: VirusTotal API Scan (Built-in)", log_file)
+        log_message(f"{'='*60}\n", log_file)
+
+        vt_results, vt_urls = vt_api_scan(
+            all_subs, domain, outdir,
+            delay=args.vt_delay,
+            vt_limit=args.vt_limit,
+            log_file=log_file
+        )
+
+    # =====================================================================
+    # PHASE 4: UNIFIED REPORT (NEW)
+    # =====================================================================
+    if args.unified_report and (subdomain_info or vt_results):
+        log_message(f"\n{'='*60}", log_file)
+        log_message(f"PHASE 4: Unified Report", log_file)
+        log_message(f"{'='*60}\n", log_file)
+
+        generate_unified_report(
+            domain, outdir, subdomain_info, vt_results,
+            log_file=log_file
+        )
+
+    # =====================================================================
+    # PHASE 5: URL SECRETS — VT URLs ONLY
+    # =====================================================================
+    url_secrets = []
+    if run_secrets and vt_urls:
+        log_message(f"\n{'='*60}", log_file)
+        log_message(f"PHASE 5: URL Secrets Scan (VT URLs only)", log_file)
+        log_message(f"{'='*60}\n", log_file)
+
+        report_file = outdir / "reports" / f"{domain}_url_secrets.txt"
+        url_secrets = scan_url_secrets(vt_urls, report_file, min_score=args.min_score, log_file=log_file)
+
+    # =====================================================================
+    # PHASE 6: 403 BYPASS
+    # =====================================================================
+    bypassed_403 = []
+    if run_bypass:
+        log_message(f"\n{'='*60}", log_file)
+        log_message(f"PHASE 6: 403 Bypass", log_file)
+        log_message(f"{'='*60}\n", log_file)
+
+        if bypass_403_urls:
+            bypassed_403 = bypass_403(bypass_403_urls, outdir, domain, threads=args.threads, log_file=log_file)
+        elif subs:
+            # Fallback: build URLs from subs if no 403 targets captured
+            fallback_urls = [f"https://{sub}" for sub in subs] + [f"http://{sub}" for sub in subs]
+            bypassed_403 = bypass_403(fallback_urls, outdir, domain, threads=args.threads, log_file=log_file)
+
+    # =====================================================================
+    # PHASE 7: MASTER REPORT
+    # =====================================================================
+    if not args.subs_only:
+        log_message(f"\n{'='*60}", log_file)
+        log_message(f"PHASE 7: Master Ranking Report", log_file)
+        log_message(f"{'='*60}\n", log_file)
+
+        all_findings = generate_master_report(
+            domain, outdir, url_secrets, bypassed_403, status_codes,
+            log_file=log_file
+        )
+
+        # Generate bug bounty ready report
+        generate_bug_bounty_report(domain, outdir, all_findings, log_file=log_file)
+
+    # =====================================================================
+    # DONE
+    # =====================================================================
+    log_message(f"\n{'='*60}", log_file)
+    log_message(f"ALL DONE! Results in: {outdir.absolute()}", log_file)
+    log_message(f"{'='*60}\n", log_file)
+    log_message("Key files:", log_file)
+    log_message(f"  Subdomains:    {outdir / 'subs' / f'{domain}_subs_all.txt'}", log_file)
+    log_message(f"  Live Subs:     {outdir / 'subs' / f'{domain}_subs_live.txt'}", log_file)
+    log_message(f"  Status Codes:  {outdir / 'reports' / f'{domain}_status_codes.txt'}", log_file)
+    log_message(f"  UNIFIED:       {outdir / 'reports' / f'{domain}_unified_report.txt'}", log_file)
+    log_message(f"  VT Input:      {outdir / 'vt' / 'virus.txt'}", log_file)
+    log_message(f"  VT Output:     {outdir / 'vt' / 'vt.txt'}", log_file)
+    log_message(f"  VT Cache:      {outdir / 'vt' / 'vt_cache.json'}", log_file)
+    log_message(f"  URL Secrets:   {outdir / 'reports' / f'{domain}_url_secrets.txt'}", log_file)
+    log_message(f"  403 Bypass:    {outdir / 'reports' / f'{domain}_403_bypass.txt'}", log_file)
+    log_message(f"  MASTER RANKED: {outdir / 'reports' / f'{domain}_master_ranked.txt'}", log_file)
+    log_message(f"  BUG BOUNTY:    {outdir / 'reports' / f'{domain}_bug_bounty_ready.txt'}", log_file)
+    log_message("")
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n[!] Interrupted by user. Exiting...")
+        sys.exit(0)
