@@ -79,9 +79,9 @@ DEFAULT_DELAY = 0.1
 # VIRUSTOTAL API KEYS (built-in rotation)
 # =============================================================================
 VT_API_KEYS = [
-    "9fdf8bf28e19f8cd45800756f7f3a740cd7e09913d9eadb79e1e8ae9f41cf88b",
-    "3ea967cdca70e94d8bf41bf9773cfee7f7d72e03efc306226bc453c7c1a36410",
-    "905c7d4d2a12fa09b24ecb74b1a702650dad20aa2fde81ccaea33ca90b1e9912",
+    "xxx",
+    "xxx",
+    "xxx",
 ]
 
 # =============================================================================
